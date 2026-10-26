@@ -2,26 +2,46 @@
 Mitigation policies for the strategic AV vs. Human repeated game
 (Section 3 of LLM_Agent_For_AV_Human_Interaction.ipynb).
 
-Baseline recap
----------------
-The AV holds a Beta belief mu_AV over "the human will rush" and yields
-whenever mu_AV crosses a fixed threshold mu_av_star. Because yielding is
-always observed as evidence of a "soft" AV, humans learn to rush more,
-mu_AV keeps climbing, and the AV converges to yielding ~100% of the time
-("bullying"/exploitation).
+Final Model (repeated incomplete-information game, mutual belief update)
+------------------------------------------------------------------------
+Human (opponent is an AV w.p. alpha, a human playing q* otherwise):
+    EU_H(R) = alpha[mu_H v + (1-mu_H)(-c)] + (1-alpha)[q*(-c) + (1-q*)v]
+    EU_H(Y) = alpha(-w) + (1-alpha)[q*(-w)]
+    r_i = 1[EU_H(R) > EU_H(Y)] = 1[mu_H,i > mu_H*],   mu_H* ~= 0.452
 
-This module adds three toggleable AV policies that intervene on that loop:
+AV (knows the opponent is human via V2V, so no alpha):
+    EU_AV(R) = mu_AV(-c) + (1-mu_AV)v
+    EU_AV(Y) = mu_AV(-gamma_AV w)
+    yields iff mu_AV > mu_AV* = v / (c + v - gamma_AV w) ~= 0.347
 
-  Policy A  -- AVPolicyA   : eHMI + waiting-time trigger
-  Policy B  -- AVPolicyB   : Intelligent Intersection (I2V / RSU) FCFS
-  Policy C  -- AVPolicyC   : interaction-aware commitment prediction
+Beta-Bernoulli beliefs:
+    Human i: mu_H,i = P(AV yields),    a_i += y,      b_i += 1 - y
+             prior Beta(10 mu_0, 10(1 - mu_0))
+    AV:      mu_AV  = P(human rushes), a_AV += r_hat, b_AV += 1 - r_hat
+             prior Beta(1, 3), so mu_AV,0 = 0.25
 
-All four policies (baseline included) share one `Human` population and one
+Standard template (shared by every policy)
+------------------------------------------
+Each interaction between the single AV and human i runs the same steps:
+
+    1. intent       r_i = 1[mu_H,i > mu_H*]
+    2. commitment   u ~ U(0,1), beta_i ~ U(0.1, 0.6), drawn before the AV decides
+    3. AV action    (y, sigma) = pi(mu_AV, .)              <- the only per-policy part
+    4. eHMI         r_i^eff = r_i (1 - sigma),   kappa_i = r_i^eff 1[u > beta_i]
+    5. outcome map  (outcome, r_hat) = resolve(y, r_i^eff, kappa_i)
+    6. Beta updates for the human (on y) and the AV (on r_hat)
+
+The AV learns from r_hat, not r: a bluff that gets called counts as a yield.
+
+  Baseline -- AVBaseline : y = 1[mu_AV > mu_AV*]
+  Policy A -- AVPolicyA  : eHMI + waiting-time trigger (streak s, signal sigma)
+  Policy B -- AVPolicyB  : Intelligent Intersection (I2V / RSU), FCFS
+  Policy C -- AVPolicyC  : interaction-aware commitment prediction
+
+All four policies share one `Human` population and one
 `simulate_population(policy, ...)` entry point so they can be swapped with a
 single string argument and compared on identical scenarios.
 """
-
-from collections import defaultdict
 
 import numpy as np
 
@@ -36,62 +56,58 @@ q_star = 0.25
 N_HUMANS = 500
 N_ROUNDS = 30
 
+HUMAN_PRIOR_STRENGTH = 10   # human prior: Beta(10 mu_0, 10(1 - mu_0))
+AV_PRIOR = (1, 3)           # AV prior: Beta(1, 3), mu_AV,0 = 0.25
+
 # ── New parameters for the mitigation policies ───────────────────────────────
-WAIT_THRESHOLD = 3          # Policy A: consecutive yields before AV asserts via eHMI
-SAFETY_THRESHOLD = 0.5      # Policy C: predicted-commitment cutoff for yielding
-SIGNAL_NOISE_STD = 0.25     # Policy C: sensor noise on the commitment signal
-BLUFF_PROB_RANGE = (0.1, 0.6)  # per-human hidden trait: P(backs off if truly challenged)
+WAIT_THRESHOLD = 3          # Policy A: W_th, consecutive yields before AV asserts via eHMI
+SAFETY_THRESHOLD = 0.5      # Policy C: theta_s, predicted-commitment cutoff for yielding
+SIGNAL_NOISE_STD = 0.25     # Policy C: sigma, sensor noise on the commitment signal
+BLUFF_PROB_RANGE = (0.1, 0.6)  # beta_i ~ U(0.1, 0.6): P(human backs off if truly challenged)
+
+
+# ── Payoffs and thresholds ───────────────────────────────────────────────────
+def eu_human_rush(mu_h, alpha=alpha, v=v, c=c, q_star=q_star):
+    """EU_H(R) = alpha[mu_H v + (1-mu_H)(-c)] + (1-alpha)[q*(-c) + (1-q*)v]"""
+    av_branch = mu_h * v + (1 - mu_h) * (-c)
+    human_branch = q_star * (-c) + (1 - q_star) * v
+    return alpha * av_branch + (1 - alpha) * human_branch
+
+
+def eu_human_yield(alpha=alpha, w=w, q_star=q_star):
+    """EU_H(Y) = alpha(-w) + (1-alpha)[q*(-w)]"""
+    return alpha * (-w) + (1 - alpha) * (q_star * (-w))
+
+
+def eu_av_rush(mu_av, v=v, c=c):
+    """EU_AV(R) = mu_AV(-c) + (1-mu_AV)v"""
+    return mu_av * (-c) + (1 - mu_av) * v
+
+
+def eu_av_yield(mu_av, w=w, gamma_av=gamma_av):
+    """EU_AV(Y) = mu_AV(-gamma_AV w)"""
+    return mu_av * (-gamma_av * w)
 
 
 def compute_threshold(alpha, v, c, w, q_star):
-    """Human's belief threshold above which rushing dominates (unchanged from Sec. 3)."""
+    """mu_H* = [EU_H(Y) - (1-alpha)(q*(-c) + (1-q*)v) + alpha c] / [alpha(v+c)]"""
     human_branch = q_star * (-c) + (1 - q_star) * v
-    eu_y = alpha * (-w) + (1 - alpha) * (q_star * (-w))
-    numerator = eu_y - (1 - alpha) * human_branch + alpha * c
+    numerator = eu_human_yield(alpha, w, q_star) - (1 - alpha) * human_branch + alpha * c
     return numerator / (alpha * (v + c))
 
 
+def compute_av_threshold(v, c, w, gamma_av):
+    """mu_AV* = v / (c + v - gamma_AV w)"""
+    return v / (c + v - gamma_av * w)
+
+
 mu_h_star = compute_threshold(alpha, v, c, w, q_star)
-mu_av_star = v / (c + v - gamma_av * w)
+mu_av_star = compute_av_threshold(v, c, w, gamma_av)
 
 
-# ── Human agent ───────────────────────────────────────────────────────────────
-class Human:
-    """Beta-belief human, plus a fixed hidden 'bluff_prob' trait used only for
-    measuring ground-truth commitment (never read by any AV decision rule
-    except Policy C's noisy sensor)."""
-
-    def __init__(self, a0, b0, bluff_prob=None, rng=None):
-        self.a = a0
-        self.b = b0
-        rng = rng or np.random.default_rng()
-        self.bluff_prob = (
-            bluff_prob if bluff_prob is not None else rng.uniform(*BLUFF_PROB_RANGE)
-        )
-
-    @property
-    def mu(self):
-        return self.a / (self.a + self.b)
-
-    def decide(self):
-        """Nominal incentive-based intent: rush if dominance gap > 0."""
-        eu_r = alpha * (self.mu * v + (1 - self.mu) * (-c)) + (1 - alpha) * (
-            q_star * (-c) + (1 - q_star) * v
-        )
-        eu_y = alpha * (-w) + (1 - alpha) * (q_star * (-w))
-        return eu_r > eu_y
-
-    def update_belief(self, av_yielded):
-        if av_yielded:
-            self.a += 1
-        else:
-            self.b += 1
-
-
-# ── AV policies ───────────────────────────────────────────────────────────────
-class AVBaseline:
-    """Strategic AV from Section 3: yields whenever its belief that the human
-    will rush exceeds the fixed threshold mu_av_star. No mitigation."""
+# ── Beliefs and agents ───────────────────────────────────────────────────────
+class BetaBelief:
+    """Beta-Bernoulli belief: mu = a / (a + b); a success adds to a, else to b."""
 
     def __init__(self, a0, b0):
         self.a = a0
@@ -101,41 +117,91 @@ class AVBaseline:
     def mu(self):
         return self.a / (self.a + self.b)
 
-    def decide(self):
-        return self.mu > mu_av_star
-
-    def update_belief(self, human_rushed):
-        if human_rushed:
+    def _observe(self, success):
+        if success:
             self.a += 1
         else:
             self.b += 1
 
 
+class Human(BetaBelief):
+    """Human i with belief mu_H,i = P(AV yields), plus a fixed hidden trait
+    beta_i = P(backs off if truly challenged). beta_i only sets ground-truth
+    commitment kappa_i; no AV reads it except through Policy C's noisy sensor."""
+
+    def __init__(self, a0, b0, bluff_prob=None, rng=None):
+        super().__init__(a0, b0)
+        rng = rng or np.random.default_rng()
+        self.beta = bluff_prob if bluff_prob is not None else rng.uniform(*BLUFF_PROB_RANGE)
+
+    def decide(self):
+        """Intent r_i = 1[EU_H(R) > EU_H(Y)], i.e. rush iff mu_H,i > mu_H*."""
+        return eu_human_rush(self.mu) > eu_human_yield()
+
+    def update_belief(self, av_yielded):
+        """a_i += y, b_i += 1 - y"""
+        self._observe(av_yielded)
+
+
+# ── AV policies ───────────────────────────────────────────────────────────────
+class AVBaseline(BetaBelief):
+    """Final Model AV: belief mu_AV = P(human rushes), y = 1[mu_AV > mu_AV*].
+
+    Every policy follows this template and overrides only `decide`, the policy
+    pi in y = pi(mu_AV, .). Policy B also overrides `resolve`, because the RSU
+    assignment replaces the outcome map.
+    """
+
+    def __init__(self, a0, b0):
+        super().__init__(a0, b0)
+
+    def would_yield(self):
+        """y_tilde = 1[EU_AV(Y) > EU_AV(R)] = 1[mu_AV > mu_AV*]"""
+        return self.mu > mu_av_star
+
+    def decide(self, kappa):
+        """Return (y, sigma): AV yields?, eHMI signal shown?
+
+        kappa is the human's real-time commitment, available to every policy
+        but read only by Policy C."""
+        return self.would_yield(), False
+
+    def resolve(self, y, r_eff, kappa):
+        return resolve_outcome(y, r_eff, kappa)
+
+    def update_belief(self, human_rushed):
+        """a_AV += r_hat, b_AV += 1 - r_hat"""
+        self._observe(human_rushed)
+
+
 class AVPolicyA(AVBaseline):
     """eHMI + waiting-time trigger.
 
-    Decides exactly like the baseline, but tracks consecutive yields. Once
-    the streak reaches `wait_threshold`, the AV asserts right-of-way via an
-    explicit eHMI signal instead of yielding again, and resets the counter.
-    A credible eHMI assertion is assumed to make a rational human back off
-    for that round (handled in `simulate_population`).
+        y_tilde = 1[mu_AV > mu_AV*]
+        sigma   = 1[y_tilde = 1 and s >= W_th]
+        y       = y_tilde (1 - sigma)
+        s <- 0 if sigma = 1;  s + 1 if sigma = 0, y_tilde = 1;  0 if y_tilde = 0
+
+    There is one AV, so the streak s carries over from one human to the next.
+    A credible eHMI assertion makes the human yield (r_i^eff = 0), so a
+    signal step resolves as success with r_hat = 0.
     """
 
     def __init__(self, a0, b0, wait_threshold=WAIT_THRESHOLD):
         super().__init__(a0, b0)
         self.wait_threshold = wait_threshold
-        self.consecutive_yields = 0
-        self.signaling = False  # True on rounds where the AV asserts via eHMI
+        self.consecutive_yields = 0  # streak s
 
-    def decide(self):
-        would_yield = self.mu > mu_av_star
-        if would_yield and self.consecutive_yields >= self.wait_threshold:
-            self.signaling = True
+    def decide(self, kappa):
+        would_yield = self.would_yield()
+        sigma = would_yield and self.consecutive_yields >= self.wait_threshold
+        if sigma:
             self.consecutive_yields = 0
-            return False  # assert / reclaim right-of-way
-        self.signaling = False
-        self.consecutive_yields = self.consecutive_yields + 1 if would_yield else 0
-        return would_yield
+        elif would_yield:
+            self.consecutive_yields += 1
+        else:
+            self.consecutive_yields = 0
+        return would_yield and not sigma, sigma
 
 
 class IntersectionManager:
@@ -145,34 +211,46 @@ class IntersectionManager:
     def __init__(self, rng=None):
         self.rng = rng or np.random.default_rng()
 
-    def av_has_priority(self):
-        av_arrival = self.rng.random()
-        human_arrival = self.rng.random()
-        return av_arrival < human_arrival
+    def human_has_priority(self):
+        """t_AV, t_H ~ U(0,1), drawn fresh each interaction; 1[t_H < t_AV]."""
+        t_av = self.rng.random()
+        t_h = self.rng.random()
+        return t_h < t_av
 
 
 class AVPolicyB(AVBaseline):
-    """Defers all right-of-way decisions to the Intelligent Intersection.
-    The AV (and, symmetrically, the human) simply complies with the
-    infrastructure's FCFS assignment -- priority is non-negotiable."""
+    """Intelligent Intersection (I2V / RSU), first-come-first-served.
+
+        y = pi_B(t_AV, t_H) = 1[t_H < t_AV],   r_hat = y,   outcome = success
+
+    Neither mu_AV nor mu_H enters the decision. Both beliefs are still updated
+    (and drift toward 0.5) but are never used.
+    """
 
     def __init__(self, a0, b0, manager=None):
         super().__init__(a0, b0)
         self.manager = manager or IntersectionManager()
 
-    def decide(self):
-        return not self.manager.av_has_priority()  # yields iff it lacks priority
+    def decide(self, kappa):
+        return self.manager.human_has_priority(), False
+
+    def resolve(self, y, r_eff, kappa):
+        # The human must follow the RSU's assignment, so exactly one party
+        # proceeds: collision and gridlock can't happen.
+        return "success", y
 
 
 class AVPolicyC(AVBaseline):
-    """Interaction-aware prediction & planning.
+    """Interaction-aware commitment prediction.
 
-    Instead of reacting to the slow-moving population-level belief mu_AV,
-    the AV reads a noisy, real-time behavioral cue (gap acceptance /
-    deceleration / lateral drift, abstracted as `true_commit` + sensor
-    noise) and only yields if the predicted commitment crosses a safety
-    threshold. This lets it tell a genuinely committed human apart from one
-    who is bluffing/exploiting the historical pattern.
+        p_hat = clip(kappa_i + eps, 0, 1),   eps ~ N(0, sigma^2)
+        y     = pi_C(kappa_i, eps) = 1[p_hat > theta_s]
+
+    The decision ignores mu_AV: the AV responds to the real-time commitment
+    cue (gap acceptance / deceleration / lateral drift), not to its belief
+    about the population. mu_AV is still updated.
+        P(y=1 | kappa=1) = Phi(theta_s / sigma)     ~= 0.977
+        P(y=1 | kappa=0) = 1 - Phi(theta_s / sigma) ~= 0.023
     """
 
     def __init__(
@@ -189,14 +267,14 @@ class AVPolicyC(AVBaseline):
         self.rng = rng or np.random.default_rng()
         self.last_predicted_commit = None
 
-    def predict_commitment(self, true_commit):
-        signal = float(true_commit) + self.rng.normal(0, self.noise_std)
+    def predict_commitment(self, kappa):
+        signal = float(kappa) + self.rng.normal(0, self.noise_std)
         return float(np.clip(signal, 0.0, 1.0))
 
-    def decide(self, true_commit):
-        predicted = self.predict_commitment(true_commit)
+    def decide(self, kappa):
+        predicted = self.predict_commitment(kappa)
         self.last_predicted_commit = predicted
-        return predicted > self.safety_threshold
+        return predicted > self.safety_threshold, False
 
 
 POLICY_CLASSES = {
@@ -222,13 +300,13 @@ def _make_av(policy, av_a0, av_b0, rng, wait_threshold, safety_threshold, noise_
 
 
 def resolve_outcome(av_yields, human_rushed, true_commit):
-    """Real-world resolution of one AV/human interaction.
+    """Outcome map shared by the Final Model and Policies A and C.
 
-    Returns (outcome, final_human_rushed) where outcome is one of
-    'success' (exactly one party proceeds), 'collision' (both proceed and
-    the human was genuinely committed), or 'gridlock' (both yield).
-    A human who nominally "rushes" but is not truly committed (a bluff)
-    backs off for real once the AV holds firm.
+    Returns (outcome, r_hat), where r_hat is the human action the AV observes:
+        y=1, r=0         -> gridlock,      r_hat = 0
+        y=0, r=1, k=1    -> collision,     r_hat = 1
+        y=0, r=1, k=0    -> bluff called,  r_hat = 0  (counts as success)
+        otherwise        -> success,       r_hat = r
     """
     if av_yields and not human_rushed:
         return "gridlock", False
@@ -278,8 +356,8 @@ def simulate_population(
     policy,
     human_mus_init,
     n_rounds=N_ROUNDS,
-    av_a0=1,
-    av_b0=3,
+    av_a0=AV_PRIOR[0],
+    av_b0=AV_PRIOR[1],
     wait_threshold=WAIT_THRESHOLD,
     safety_threshold=SAFETY_THRESHOLD,
     noise_std=SIGNAL_NOISE_STD,
@@ -295,8 +373,8 @@ def simulate_population(
     rng = np.random.default_rng(seed)
     humans = []
     for mu0 in human_mus_init:
-        a0 = mu0 * 10
-        b0 = (1.0 - mu0) * 10
+        a0 = mu0 * HUMAN_PRIOR_STRENGTH
+        b0 = (1.0 - mu0) * HUMAN_PRIOR_STRENGTH
         humans.append(Human(a0, b0, rng=rng))
 
     av = _make_av(policy, av_a0, av_b0, rng, wait_threshold, safety_threshold, noise_std)
@@ -321,32 +399,21 @@ def simulate_population(
         round_outcomes = []
 
         for human in humans:
-            nominal_rushed = human.decide()
+            # Steps 1-2: intent, and the commitment draw 1[u > beta_i], made
+            # before the AV decides because Policy C senses it.
+            rushed = human.decide()
+            holds_firm = rng.random() > human.beta
+            sensed_commit = rushed and holds_firm
 
-            if policy == "C":
-                true_commit_pre = nominal_rushed and (rng.random() > human.bluff_prob)
-                av_yields = av.decide(true_commit_pre)
-            else:
-                av_yields = av.decide()
+            # Step 3: the only policy-specific step, (y, sigma) = pi(mu_AV, .)
+            av_yields, signaling = av.decide(sensed_commit)
 
-            if policy == "A" and getattr(av, "signaling", False):
-                nominal_rushed_eff = False  # rational human yields to a credible eHMI assertion
-            else:
-                nominal_rushed_eff = nominal_rushed
+            # Step 4: a credible eHMI assertion makes the human yield.
+            rushed_eff = rushed and not signaling
+            true_commit = rushed_eff and holds_firm
 
-            if policy == "C":
-                true_commit = true_commit_pre
-            else:
-                true_commit = nominal_rushed_eff and (rng.random() > human.bluff_prob)
-
-            if policy == "B":
-                final_human_rushed = av_yields  # RSU-mandated compliance, no contest possible
-                outcome = "success"
-            else:
-                outcome, final_human_rushed = resolve_outcome(
-                    av_yields, nominal_rushed_eff, true_commit
-                )
-
+            # Steps 5-6: outcome map, then Beta updates (the AV learns from r_hat).
+            outcome, final_human_rushed = av.resolve(av_yields, rushed_eff, true_commit)
             human.update_belief(av_yielded=av_yields)
             av.update_belief(human_rushed=final_human_rushed)
 
